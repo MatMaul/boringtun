@@ -31,13 +31,14 @@ pub mod udp;
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::thread::JoinHandle;
 
+use crate::integration::{NonWireguardHandler, PacketInjector};
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
@@ -89,7 +90,7 @@ enum Action {
 type Handler = Box<dyn Fn(&mut LockReadGuard<Device>, &mut ThreadData) -> Action + Send + Sync>;
 
 pub struct DeviceHandle {
-    device: Arc<Lock<Device>>, // The interface this handle owns
+    pub device: Arc<Lock<Device>>, // The interface this handle owns
     threads: Vec<JoinHandle<()>>,
 }
 
@@ -142,6 +143,10 @@ pub struct Device {
     mtu: AtomicUsize,
 
     rate_limiter: Option<Arc<RateLimiter>>,
+
+    non_wg_handler: Option<Arc<Mutex<dyn NonWireguardHandler>>>,
+
+    packet_injector: Option<Arc<PacketInjector>>,
 
     #[cfg(target_os = "linux")]
     uapi_fd: i32,
@@ -287,7 +292,7 @@ impl Device {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn update_peer(
+    pub fn update_peer(
         &mut self,
         pub_key: x25519_dalek::PublicKey,
         remove: bool,
@@ -321,6 +326,10 @@ impl Device {
             keepalive,
             next_index,
             None,
+            match &self.non_wg_handler {
+                Some(h) => Some(h.clone()),
+                None => None,
+            },
         )
         .unwrap();
 
@@ -368,6 +377,8 @@ impl Device {
             cleanup_paths: Default::default(),
             mtu: AtomicUsize::new(mtu),
             rate_limiter: None,
+            non_wg_handler: None,
+            packet_injector: None,
             #[cfg(target_os = "linux")]
             uapi_fd,
         };
@@ -395,7 +406,7 @@ impl Device {
         Ok(device)
     }
 
-    fn open_listen_socket(&mut self, mut port: u16) -> Result<(), Error> {
+    pub fn open_listen_socket(&mut self, mut port: u16) -> Result<(), Error> {
         // Binds the network facing interfaces
         // First close any existing open socket, and remove them from the event loop
         if let Some(s) = self.udp4.take() {
@@ -435,15 +446,31 @@ impl Device {
 
         self.register_udp_handler(Arc::clone(&udp_sock4))?;
         self.register_udp_handler(Arc::clone(&udp_sock6))?;
-        self.udp4 = Some(udp_sock4);
-        self.udp6 = Some(udp_sock6);
+        self.udp4 = Some(Arc::clone(&udp_sock4));
+        self.udp6 = Some(Arc::clone(&udp_sock6));
+
+        self.packet_injector = Some(Arc::new(PacketInjector {
+            udp4: udp_sock4,
+            udp6: udp_sock6,
+        }));
 
         self.listen_port = port;
 
         Ok(())
     }
 
-    fn set_key(&mut self, private_key: x25519_dalek::StaticSecret) {
+    pub fn set_non_wg_handler(&mut self, v: Arc<Mutex<dyn NonWireguardHandler>>) {
+        self.non_wg_handler = Some(v);
+    }
+
+    pub fn get_packet_injector(&mut self) -> Option<Arc<PacketInjector>> {
+        match &self.packet_injector {
+            Some(packet_injecter) => Some(packet_injecter.clone()),
+            None => None,
+        }
+    }
+
+    pub fn set_key(&mut self, private_key: x25519_dalek::StaticSecret) {
         let mut bad_peers = vec![];
 
         let public_key = x25519_dalek::PublicKey::from(&private_key);
@@ -484,7 +511,7 @@ impl Device {
         }
     }
 
-    fn set_fwmark(&mut self, mark: u32) -> Result<(), Error> {
+    pub fn set_fwmark(&mut self, mark: u32) -> Result<(), Error> {
         self.fwmark = Some(mark);
 
         // First set fwmark on listeners
@@ -579,17 +606,17 @@ impl Device {
         Ok(())
     }
 
-    pub(crate) fn trigger_yield(&self) {
+    pub fn trigger_yield(&self) {
         self.queue
             .trigger_notification(self.yield_notice.as_ref().unwrap())
     }
 
-    pub(crate) fn trigger_exit(&self) {
+    pub fn trigger_exit(&self) {
         self.queue
             .trigger_notification(self.exit_notice.as_ref().unwrap())
     }
 
-    pub(crate) fn cancel_yield(&self) {
+    pub fn cancel_yield(&self) {
         self.queue
             .stop_notification(self.yield_notice.as_ref().unwrap())
     }
@@ -606,16 +633,33 @@ impl Device {
 
                 // Loop while we have packets on the anonymous connection
                 while let Ok((addr, packet)) = udp.recvfrom(&mut t.src_buf[..]) {
+                    let parsed_packet = match Tunn::parse_incoming_packet(packet) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            match &d.non_wg_handler {
+                                Some(v) => {
+                                    v.lock().handle_non_wg_packet(Some(addr), packet);
+                                }
+                                None => (),
+                            };
+                            continue;
+                        }
+                    };
+
                     // The rate limiter initially checks mac1 and mac2, and optionally asks to send a cookie
-                    let parsed_packet =
-                        match rate_limiter.verify_packet(Some(addr.ip()), packet, &mut t.dst_buf) {
-                            Ok(packet) => packet,
-                            Err(TunnResult::WriteToNetwork(cookie)) => {
-                                udp.sendto(cookie, addr);
-                                continue;
-                            }
-                            Err(_) => continue,
-                        };
+                    match rate_limiter.verify_packet(
+                        Some(addr),
+                        &parsed_packet,
+                        packet,
+                        &mut t.dst_buf,
+                    ) {
+                        Ok(packet) => packet,
+                        Err(TunnResult::WriteToNetwork(cookie)) => {
+                            udp.sendto(cookie, addr);
+                            continue;
+                        }
+                        Err(_) => continue,
+                    };
 
                     let peer = match &parsed_packet {
                         Packet::HandshakeInit(p) => {
@@ -672,11 +716,10 @@ impl Device {
                     }
 
                     // This packet was OK, that means we want to create a connected socket for this peer
-                    let ip_addr = addr.ip();
                     p.set_endpoint(addr);
                     if d.config.use_connected_socket {
                         if let Ok(sock) = p.connect_endpoint(d.listen_port, d.fwmark) {
-                            d.register_conn_handler(Arc::clone(peer), sock, ip_addr)
+                            d.register_conn_handler(Arc::clone(peer), sock, addr)
                                 .unwrap();
                         }
                     }
@@ -696,7 +739,7 @@ impl Device {
         &self,
         peer: Arc<Mutex<Peer>>,
         udp: Arc<UDPSocket>,
-        peer_addr: IpAddr,
+        peer_addr: SocketAddr,
     ) -> Result<(), Error> {
         self.queue.new_event(
             udp.as_raw_fd(),

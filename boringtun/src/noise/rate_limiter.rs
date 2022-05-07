@@ -1,10 +1,10 @@
 use super::handshake::{b2s_hash, b2s_keyed_mac_16, b2s_keyed_mac_16_2, b2s_mac_24};
 use crate::noise::handshake::{LABEL_COOKIE, LABEL_MAC1};
-use crate::noise::{HandshakeInit, HandshakeResponse, Packet, Tunn, TunnResult, WireGuardError};
+use crate::noise::{HandshakeInit, HandshakeResponse, Packet, TunnResult, WireGuardError};
 
 #[cfg(feature = "mock-instant")]
 use mock_instant::Instant;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(not(feature = "mock-instant"))]
@@ -152,12 +152,11 @@ impl RateLimiter {
     /// Verify the MAC fields on the datagram, and apply rate limiting if needed
     pub fn verify_packet<'a, 'b>(
         &self,
-        src_addr: Option<IpAddr>,
+        src_addr: Option<SocketAddr>,
+        packet: &Packet,
         src: &'a [u8],
         dst: &'b mut [u8],
-    ) -> Result<Packet<'a>, TunnResult<'b>> {
-        let packet = Tunn::parse_incoming_packet(src)?;
-
+    ) -> Result<(), TunnResult<'b>> {
         // Verify and rate limit handshake messages only
         if let Packet::HandshakeInit(HandshakeInit { sender_idx, .. })
         | Packet::HandshakeResponse(HandshakeResponse { sender_idx, .. }) = packet
@@ -176,18 +175,18 @@ impl RateLimiter {
                 };
 
                 // Only given an address can we validate mac2
-                let cookie = self.current_cookie(addr);
+                let cookie = self.current_cookie(addr.ip());
                 let computed_mac2 = b2s_keyed_mac_16_2(&cookie, msg, mac1);
 
                 if verify_slices_are_equal(&computed_mac2[..16], mac2).is_err() {
                     let cookie_packet = self
-                        .format_cookie_reply(sender_idx, cookie, mac1, dst)
+                        .format_cookie_reply(*sender_idx, cookie, mac1, dst)
                         .map_err(TunnResult::Err)?;
                     return Err(TunnResult::WriteToNetwork(cookie_packet));
                 }
             }
         }
 
-        Ok(packet)
+        Ok(())
     }
 }

@@ -13,14 +13,17 @@ use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::timers::{TimerName, Timers};
 
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 /// The default value to use for rate limiting, when no other rate limiter is defined
 const PEER_HANDSHAKE_RATE_LIMIT: u64 = 10;
+
+use crate::integration::NonWireguardHandler;
 
 const IPV4_MIN_HEADER_SIZE: usize = 20;
 const IPV4_LEN_OFF: usize = 2;
@@ -70,6 +73,7 @@ pub struct Tunn {
     tx_bytes: usize,
     rx_bytes: usize,
     rate_limiter: Arc<RateLimiter>,
+    non_wg_handler: Option<Arc<Mutex<dyn NonWireguardHandler>>>,
 }
 
 type MessageType = u32;
@@ -197,6 +201,7 @@ impl Tunn {
         persistent_keepalive: Option<u16>,
         index: u32,
         rate_limiter: Option<Arc<RateLimiter>>,
+        non_wg_handler: Option<Arc<Mutex<dyn NonWireguardHandler>>>,
     ) -> Result<Self, &'static str> {
         let static_public = x25519_dalek::PublicKey::from(&static_private);
 
@@ -220,6 +225,7 @@ impl Tunn {
             rate_limiter: rate_limiter.unwrap_or_else(|| {
                 Arc::new(RateLimiter::new(&static_public, PEER_HANDSHAKE_RATE_LIMIT))
             }),
+            non_wg_handler: non_wg_handler,
         };
 
         Ok(tunn)
@@ -278,7 +284,7 @@ impl Tunn {
     /// packet is processed.
     pub fn decapsulate<'a>(
         &mut self,
-        src_addr: Option<IpAddr>,
+        src_addr: Option<SocketAddr>,
         datagram: &[u8],
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
@@ -288,9 +294,23 @@ impl Tunn {
         }
 
         let mut cookie = [0u8; COOKIE_REPLY_SZ];
-        let packet = match self
+
+        let packet = match Tunn::parse_incoming_packet(datagram) {
+            Ok(p) => p,
+            Err(_) => {
+                match &self.non_wg_handler {
+                    Some(v) => {
+                        v.lock().handle_non_wg_packet(src_addr, datagram);
+                    }
+                    None => (),
+                };
+                return TunnResult::Done;
+            }
+        };
+
+        match self
             .rate_limiter
-            .verify_packet(src_addr, datagram, &mut cookie)
+            .verify_packet(src_addr, &packet, datagram, &mut cookie)
         {
             Ok(packet) => packet,
             Err(TunnResult::WriteToNetwork(cookie)) => {

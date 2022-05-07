@@ -10,6 +10,7 @@ pub mod device;
 
 #[cfg(feature = "ffi-bindings")]
 pub mod ffi;
+pub mod integration;
 pub mod noise;
 
 #[cfg(feature = "jni-bindings")]
