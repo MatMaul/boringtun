@@ -58,24 +58,39 @@ const HANDSHAKE_RATE_LIMIT: u64 = 100; // The number of handshakes per second we
 const MAX_UDP_SIZE: usize = (1 << 16) - 1;
 const MAX_ITR: usize = 100; // Number of packets to handle per handler call
 
-#[derive(Debug)]
+#[derive(thiserror::Error, Debug)]
 pub enum Error {
+    #[error("socket error: {0}")]
     Socket(String),
+    #[error("bind error: {0}")]
     Bind(String),
+    #[error("fcntl error: {0}")]
     FCntl(String),
+    #[error("event queue error: {0}")]
     EventQueue(String),
+    #[error("ioctl error: {0}")]
     IOCtl(String),
+    #[error("connect error: {0}")]
     Connect(String),
+    #[error("setsockopt error: {0}")]
     SetSockOpt(String),
+    #[error("invalid tunnel name")]
     InvalidTunnelName,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[error("getsockopt error: {0}")]
     GetSockOpt(String),
+    #[error("getsockname error: {0}")]
     GetSockName(String),
+    #[error("udp read error: {0}")]
     UDPRead(i32),
     #[cfg(target_os = "linux")]
+    #[error("timer error: {0}")]
     Timer(String),
+    #[error("ifaceread error: {0}")]
     IfaceRead(i32),
+    #[error("dropprivileges error: {0}")]
     DropPrivileges(String),
+    #[error("apisocket error: {0}")]
     ApiSocket(std::io::Error),
 }
 

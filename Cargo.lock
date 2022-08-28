@@ -95,6 +95,7 @@ dependencies = [
  "parking_lot",
  "rand_core 0.6.3",
  "ring",
+ "thiserror",
  "tracing",
  "tracing-subscriber",
  "untrusted 0.9.0",
